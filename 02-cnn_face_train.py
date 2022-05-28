@@ -13,15 +13,20 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import time
 import sys
+from keras.utils import to_categorical
+from custom_layer import CenterLossLayer,zero_loss
 
+
+from keras.layers import Layer
+from keras import backend as K
 
 # 画像リサイズ定義
 img_width, img_height = 64, 64
 
 # バッチサイズ
-batch_size = 4
+batch_size = 2
 # エポック数（1エポックの画像サンプル数 = ステップ数 * バッチサイズ）
-nb_epoch = 2
+nb_epoch = 100
 
 # 収束判定ループ（エポック）回数
 #nb_patience = 10
@@ -31,7 +36,6 @@ val_min_delta = 0.001
 
 # 学習用画像ディレクトリパス
 train_data_dir = 'dataset/02-face/'
-
 
 def main():
 
@@ -58,23 +62,28 @@ def main():
         cnn_model = keras.models.load_model(savefile)
     else:
         print('モデル新規作成')
-        cnn_model = cnn_model_maker(nb_classes)
+        # cnn_model = cnn_model_maker(nb_classes)
+        cnn_model = functional_model(nb_classes)
         # 多クラス分類を指定
-        cnn_model.compile(loss='categorical_crossentropy',
+        cnn_model.compile(
+                  loss=['categorical_crossentropy', zero_loss],
+                  loss_weights=[1, 0.1],
                   optimizer='adam',
                   metrics=['accuracy'])
-
+        # sys.exit()
     # 画像のジェネレータ生成
     train_generator, validation_generator = image_generator(classes)
-
     # 収束判定設定。以下の条件を満たすエポックがpatience回続いたら打切り。
     # val_loss(観測上最小値) - min_delta  < val_loss
     es_cb = keras.callbacks.EarlyStopping(monitor='val_loss', min_delta=val_min_delta, patience=nb_patience, verbose=1, mode='min')
-
+    print(train_generator)
     # CNN学習
     history = cnn_model.fit_generator(
         train_generator,
         epochs=nb_epoch,
+        steps_per_epoch=80,
+        verbose=1,
+        validation_steps=20,
         validation_data=validation_generator,
         callbacks=[es_cb])
 
@@ -88,37 +97,58 @@ def main():
     plot_loss(history)
 
 
-def cnn_model_maker(nb_classes):
+
+initial_learning_rate = 1e-3
+weight_decay = 0.0005
+from keras.regularizers import l2
+
+def functional_model(nb_classes):
 
     # 入力画像ベクトル定義（RGB画像認識のため、チャネル数=3）
-    input_shape = (img_width, img_height, 3)
-
+# input_shape = (img_width, img_height, 3)
+    input = keras.Input((img_width, img_height, 1))
+    class_num_input =  keras.Input((2,))
     # CNNモデル定義（Keras CIFAR-10: 9層ニューラルネットワーク）
-    model = Sequential()
-    model.add(Conv2D(32, (3, 3), padding='same',
-                     input_shape=input_shape))
-    model.add(Activation('relu'))
-    model.add(Conv2D(32, (3, 3)))
-    model.add(Activation('relu'))
-    model.add(MaxPooling2D(pool_size=(2, 2)))
-    model.add(Dropout(0.25))
+    x = Conv2D(32, (3, 3), padding='same')(input)
+    x = Activation('relu')(x)
+    x = Conv2D(32, (3, 3))(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = Dropout(0.25)(x)
 
-    model.add(Conv2D(64, (3, 3), padding='same'))
-    model.add(Activation('relu'))
-    model.add(Conv2D(64, (3, 3)))
-    model.add(Activation('relu'))
-    model.add(MaxPooling2D(pool_size=(2, 2)))
-    model.add(Dropout(0.25))
+    x = Activation('relu')(x)
+    x = Conv2D(64, (3, 3))(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = Dropout(0.25)(x)
 
-    model.add(Flatten())
-    model.add(Dense(512))
-    model.add(Activation('relu'))
-    model.add(Dropout(0.5))
-    model.add(Dense(nb_classes))
-    model.add(Activation('softmax'))
+    x = Flatten()(x)
+    x = Dense(512)(x)
+    x = Activation('relu')(x)
+    x = Dropout(0.5)(x)
+    x = Dense(nb_classes)(x)
+    # main_output = Dense(nb_classes,activation='softmax',name='main_out')(x)
+    main = Activation('softmax', name='main_out')(x)
+    side = CenterLossLayer(name='centerlosslayer')([x,class_num_input])
+
+    model = Model([input,class_num_input],[main,side])
+
 
     return model
 
+
+class wrapper_generator(object): # rule1
+    def __init__(self,generator):
+
+        self.gene = generator
+        
+    def __iter__(self):
+    # __next__()はselfが実装してるのでそのままselfを返す
+        return self
+    
+    def __next__(self): 
+        X, Y = self.gene.next()
+        return [X,Y], Y
 
 def image_generator(classes):
     # トレーニング画像データ生成準備
@@ -132,7 +162,7 @@ def image_generator(classes):
     train_generator = datagen.flow_from_directory(
         train_data_dir,
         target_size=(img_width, img_height),
-        color_mode='rgb',
+        color_mode='grayscale',
         classes=classes,
         class_mode='categorical',
         batch_size=batch_size,
@@ -143,17 +173,18 @@ def image_generator(classes):
     validation_generator = datagen.flow_from_directory(
         train_data_dir,
         target_size=(img_width, img_height),
-        color_mode='rgb',
+        color_mode='grayscale',
         classes=classes,
         class_mode='categorical',
         batch_size=batch_size,
         shuffle=True,
         subset = "validation")
 
-    return (train_generator, validation_generator)
+    return (wrapper_generator(train_generator), wrapper_generator(validation_generator))
 
 
 def plot_loss(history):
+    print()
     # 損失関数のグラフの軸ラベルを設定
     plt.xlabel('time step')
     plt.ylabel('loss')
@@ -177,3 +208,4 @@ def plot_loss(history):
 
 if __name__ == '__main__':
     main()
+    print('done')
